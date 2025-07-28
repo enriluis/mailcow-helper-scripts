@@ -21,15 +21,6 @@
 # Options:
 #   -h, --help    Show this help message
 
-### CONFIGURATION ###
-MAILCOW_DIR="/docker-mail-mtc"
-CONFIG_FILE="${MAILCOW_DIR}/mailcow.conf"
-INPUT_FILE="${MAILCOW_DIR}/helper-scripts/address_aliases.csv"
-LOG_FILE="/tmp/sieve_filters_$(date +%Y%m%d_%H%M%S).log"
-
-# Display help information
-#!/bin/bash
-
 ###############################################################
 # Mailcow Sieve Filter Manager
 # Version: 1.3
@@ -37,6 +28,7 @@ LOG_FILE="/tmp/sieve_filters_$(date +%Y%m%d_%H%M%S).log"
 # Repository: https://github.com/enriluis/mailcow-sieve-manager
 # Description: Advanced mail routing solution for Mailcow
 ###############################################################
+
 
 ### CONFIGURATION ###
 MAILCOW_DIR="/docker-mail-mtc"
@@ -63,14 +55,6 @@ DESCRIPTION:
   3. Message flagging as high priority
   4. Automatic configuration validation
 
-  KEY DIFFERENCES FROM POSTFIXADMIN:
-  * Mailcow requires aliases + Sieve filters for multi-recipient routing
-  * Postfixadmin allows direct forwarding in account settings
-  * This script adds functionality not available in Mailcow's UI:
-    - Subject modification ([PREFIX] Original Subject)
-    - Automatic importance flagging (High Priority)
-    - Configuration validation
-
 REQUIREMENTS:
   - Mailcow environment with Docker
   - CSV file with accounts to process
@@ -92,7 +76,10 @@ EOF
     exit 0
 }
 
-# [...] (rest of the script remains the same)
+if grep -q $'\r' "${INPUT_FILE}"; then
+    echo "WARNING: File contains Windows line endings, converting..." | tee -a ${LOG_FILE}
+    sed -i 's/\r$//' "${INPUT_FILE}"
+fi
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -101,7 +88,7 @@ while [[ $# -gt 0 ]]; do
             show_help
             ;;
         *)
-            echo "Error: Unknown option $1"
+            echo "Error: Unknown option $1" | tee -a ${LOG_FILE}
             show_help
             exit 1
             ;;
@@ -164,8 +151,8 @@ execute_mysql_query() {
 
 # Check if mailbox exists
 validate_mailbox_exists() {
-    local email_address="$1"
-    local query="SELECT COUNT(*) FROM mailbox WHERE username = '${email_address}';"
+    local email="$1"
+    local query="SELECT COUNT(*) FROM mailbox WHERE username = '${email}';"
     local count
     
     count=$(execute_mysql_query "${query}")
@@ -194,16 +181,16 @@ validate_alias_exists() {
 
 # Generate Sieve script with required redirect
 generate_sieve_script() {
-    local email_address="$1"
+    local email="$1"
     local alias_email="$2"
-    local prefix=$(echo "${email_address}" | cut -d'@' -f1 | tr '[:lower:]' '[:upper:]')
+    local prefix=$(echo "${email}" | cut -d'@' -f1 | tr '[:lower:]' '[:upper:]')
 
     cat <<EOF
 require "editheader";
 require "variables";
 require "reject";
 require "imap4flags";
-if address :matches ["to", "cc"] "${email_address}" {
+if address :matches ["to", "cc"] "${email}" {
     # === Subject Modification ===
     # Option 1: When original Subject exists
     if header :matches "Subject" "*" {
@@ -247,81 +234,90 @@ log "Total mailboxes found: ${mailbox_count}"
 log "Total aliases configured: ${alias_count}"
 
 # Process each account from CSV file
-while IFS= read -r email_address || [[ -n "${email_address}" ]]; do
-    # Clean and validate email address
-    email_address=$(echo "${email_address}" | tr -d '\r\n' | xargs)
-    [[ -z "${email_address}" || "${email_address}" == \#* ]] && continue
+process_csv() {
+    local input_file="$1"
     
-    if [[ ! "${email_address}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
-        log "SKIPPED: Invalid email format '${email_address}'"
-        continue
-    fi
+    # Read entire file into array first
+    mapfile -t lines < "${input_file}"
     
-    log "Processing account: '${email_address}'"
-    
-    # Validate mailbox exists
-    if ! validate_mailbox_exists "${email_address}"; then
-        log "ERROR: Mailbox '${email_address}' not found in database - skipping"
-        continue
-    fi
-    
-    # Generate alias email
-    prefix=$(echo "${email_address}" | cut -d'@' -f1 | tr '[:lower:]' '[:upper:]')
-    alias_email="$(echo "${prefix}" | tr '[:upper:]' '[:lower:]')_alias@$(echo "${email_address}" | cut -d'@' -f2 | tr '[:upper:]' '[:lower:]')"
-    
-    # Validate alias exists - SKIP ENTIRE PROCESS IF NOT
-    if ! validate_alias_exists "${alias_email}"; then
-        log "SKIPPED: Required alias '${alias_email}' not found - no filter created"
-        continue
-    fi
-    
-    log "SUCCESS: Valid alias found at '${alias_email}' - proceeding with filter creation"
-    
-    # Generate Sieve script
-    sieve_script=$(generate_sieve_script "${email_address}" "${alias_email}")
-    script_description="${prefix} REDIRECT"
-    
-    # Prepare values for SQL
-    escaped_email=$(escape_sql_string "${email_address}")
-    escaped_description=$(escape_sql_string "${script_description}")
-    escaped_script=$(escape_sql_string "${sieve_script}")
-    
-    current_timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    
-    # Check if filter already exists
-    CHECK_QUERY="SELECT COUNT(*) FROM sieve_filters WHERE username = '${escaped_email}' AND filter_type = 'prefilter';"
-    existing_count=$(execute_mysql_query "${CHECK_QUERY}")
-    
-    if [[ ${existing_count} -gt 0 ]]; then
-        # Update existing filter
-        UPDATE_QUERY="UPDATE sieve_filters SET 
-            script_desc = '${escaped_description}',
-            script_data = '${escaped_script}',
-            script_name = 'active',
-            modified = '${current_timestamp}'
-            WHERE username = '${escaped_email}' AND filter_type = 'prefilter';"
+    for email in "${lines[@]}"; do
+        # Clean and validate email address
+        email=$(echo "${email}" | tr -d '\r\n' | xargs)
+        [[ -z "${email}" || "${email}" == \#* ]] && continue
         
-        log "Updating existing filter for ${email_address}"
-        execute_mysql_query "${UPDATE_QUERY}"
-    else
-        # Insert new filter
-        INSERT_QUERY="INSERT INTO sieve_filters
-            (username, script_desc, script_name, script_data, filter_type, created, modified)
-            VALUES
-            ('${escaped_email}', '${escaped_description}', 'active', '${escaped_script}', 'prefilter', '${current_timestamp}', '${current_timestamp}');"
+        if [[ ! "${email}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+            log "SKIPPED: Invalid email format '${email}'"
+            continue
+        fi
         
-        log "Creating new filter for ${email_address}"
-        execute_mysql_query "${INSERT_QUERY}"
-    fi
-    
-    # Verify operation result
-    if [ $? -eq 0 ]; then
-        log "COMPLETED: Successfully processed ${email_address}"
-    else
-        log "ERROR: Failed to process filter for ${email_address}"
-    fi
-    
-done < "${INPUT_FILE}"
+        log "Processing account: '${email}'"
+        
+        # Validate mailbox exists
+        if ! validate_mailbox_exists "${email}"; then
+            log "ERROR: Mailbox '${email}' not found in database - skipping"
+            continue
+        fi
+        
+        # Generate alias email
+        prefix=$(echo "${email}" | cut -d'@' -f1 | tr '[:lower:]' '[:upper:]')
+        alias_email="$(echo "${prefix}" | tr '[:upper:]' '[:lower:]')_alias@$(echo "${email}" | cut -d'@' -f2 | tr '[:upper:]' '[:lower:]')"
+        
+        # Validate alias exists
+        if ! validate_alias_exists "${alias_email}"; then
+            log "SKIPPED: Required alias '${alias_email}' not found - no filter created"
+            continue
+        fi
+        
+        log "SUCCESS: Valid alias found at '${alias_email}' - proceeding with filter creation"
+        
+        # Generate Sieve script
+        sieve_script=$(generate_sieve_script "${email}" "${alias_email}")
+        script_description="${prefix} REDIRECT"
+        
+        # Prepare values for SQL
+        escaped_email=$(escape_sql_string "${email}")
+        escaped_description=$(escape_sql_string "${script_description}")
+        escaped_script=$(escape_sql_string "${sieve_script}")
+        
+        current_timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+        
+        # Check if filter already exists
+        CHECK_QUERY="SELECT COUNT(*) FROM sieve_filters WHERE username = '${escaped_email}' AND filter_type = 'prefilter';"
+        existing_count=$(execute_mysql_query "${CHECK_QUERY}")
+        
+        if [[ ${existing_count} -gt 0 ]]; then
+            # Update existing filter
+            UPDATE_QUERY="UPDATE sieve_filters SET 
+                script_desc = '${escaped_description}',
+                script_data = '${escaped_script}',
+                script_name = 'active',
+                modified = '${current_timestamp}'
+                WHERE username = '${escaped_email}' AND filter_type = 'prefilter';"
+            
+            log "Updating existing filter for ${email}"
+            execute_mysql_query "${UPDATE_QUERY}"
+        else
+            # Insert new filter
+            INSERT_QUERY="INSERT INTO sieve_filters
+                (username, script_desc, script_name, script_data, filter_type, created, modified)
+                VALUES
+                ('${escaped_email}', '${escaped_description}', 'active', '${escaped_script}', 'prefilter', '${current_timestamp}', '${current_timestamp}');"
+            
+            log "Creating new filter for ${email}"
+            execute_mysql_query "${INSERT_QUERY}"
+        fi
+        
+        # Verify operation result
+        if [ $? -eq 0 ]; then
+            log "COMPLETED: Successfully processed ${email}"
+        else
+            log "ERROR: Failed to process filter for ${email}"
+        fi
+    done
+}
+
+# Call function to process CSV
+process_csv "${INPUT_FILE}"
 
 log "Process completed successfully"
 log "Detailed execution log available at: ${LOG_FILE}"
