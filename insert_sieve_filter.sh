@@ -1,14 +1,5 @@
 #!/bin/bash
 
-###############################################################
-# Mailcow Sieve Filter Manager
-# Version: 1.2
-# Author: Enri Luis <enriluis@gmail.com>
-# Description: Automates creation/update of Sieve filters in Mailcow
-#              with strict alias validation - only creates filters
-#              when the alias exists.
-###############################################################
-
 ### REQUIREMENTS ###
 # 1. Mailcow environment with docker
 # 2. Access to Mailcow's MySQL database
